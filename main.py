@@ -1,4 +1,6 @@
 import sys
+import tempfile
+import os
 import numpy as np
 from PIL import Image as PILImage
 from PyQt6.QtWidgets import (
@@ -73,18 +75,20 @@ class CountWorker(QThread):
     finished = pyqtSignal(float, object)   # count, density_map (numpy 2-D)
     failed = pyqtSignal(str)
 
-    def __init__(self, img_path: str, model_name: str, model_weights: str):
+    def __init__(self, img_path: str, model_name: str, model_weights: str, max_dim: int | None):
         super().__init__()
         self.img_path = img_path
         self.model_name = model_name
         self.model_weights = model_weights
+        self.max_dim = max_dim  # None = full resolution
 
     def run(self):
+        tmp_path = None
         try:
             # Patch lwcc's broken weights path (uses /.lwcc instead of ~/.lwcc)
             import lwcc.util.functions as _lwcc_fn
             from pathlib import Path
-            import os, gdown as _gdown
+            import gdown as _gdown
 
             def _weights_check_fixed(model_name, model_weights):
                 weights_dir = Path.home() / ".lwcc" / "weights"
@@ -98,17 +102,35 @@ class CountWorker(QThread):
 
             _lwcc_fn.weights_check = _weights_check_fixed
 
+            # Resize image to max_dim before inference to control memory usage.
+            # We write a temp PNG so lwcc always receives a pre-scaled image
+            # and we always pass resize_img=False to prevent double-scaling.
+            infer_path = self.img_path
+            img = PILImage.open(self.img_path).convert("RGB")
+            w, h = img.size
+            if self.max_dim is not None and max(w, h) > self.max_dim:
+                scale = self.max_dim / max(w, h)
+                img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+                tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+                tmp_path = tmp.name
+                tmp.close()
+                img.save(tmp_path)
+                infer_path = tmp_path
+
             from lwcc import LWCC
             count, density = LWCC.get_count(
-                self.img_path,
+                infer_path,
                 model_name=self.model_name,
                 model_weights=self.model_weights,
                 return_density=True,
-                resize_img=False,   # keep full resolution for accurate counts
+                resize_img=False,
             )
             self.finished.emit(float(count), density)
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
 # ---------------------------------------------------------------------------
 # Clickable image label
@@ -293,6 +315,27 @@ class ImageViewer(QMainWindow):
         # Populate with defaults
         self._on_model_changed(DEFAULT_MODEL)
 
+        layout.addSpacing(6)
+
+        # Max resolution dropdown
+        res_label = QLabel("Max Resolution")
+        res_label.setStyleSheet(LABEL_STYLE)
+        layout.addWidget(res_label)
+
+        self._res_combo = QComboBox()
+        self._res_combo.setStyleSheet(COMBO_STYLE)
+        self._res_combo.addItems(["1000 px", "2000 px", "3000 px", "4000 px", "Full"])
+        self._res_combo.setCurrentText("2000 px")
+        layout.addWidget(self._res_combo)
+
+        self._res_desc = QLabel(
+            "Longest edge limit before inference. Lower = faster and less memory. "
+            "Full resolution may use very large amounts of RAM."
+        )
+        self._res_desc.setWordWrap(True)
+        self._res_desc.setStyleSheet(DESC_STYLE)
+        layout.addWidget(self._res_desc)
+
         layout.addSpacing(10)
 
         # Count button
@@ -420,8 +463,10 @@ class ImageViewer(QMainWindow):
 
         model_name = self._model_combo.currentText()
         weights = self._weights_combo.currentText()
+        res_text = self._res_combo.currentText()
+        max_dim = None if res_text == "Full" else int(res_text.split()[0])
 
-        self._worker = CountWorker(self._img_path, model_name, weights)
+        self._worker = CountWorker(self._img_path, model_name, weights, max_dim)
         self._worker.finished.connect(self._on_count_done)
         self._worker.failed.connect(self._on_count_error)
         self._worker.start()
