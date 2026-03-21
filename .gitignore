@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyCharm
+.idea/
+
+# Claude Code
+.claude/
+
+# Model weights cache
+.lwcc/
+
+# macOS
+.DS_Store
+
+# Environment variables
+.env
+.env.*
