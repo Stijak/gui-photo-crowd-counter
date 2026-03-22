@@ -7,7 +7,7 @@ from PIL import Image as PILImage
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QFileDialog, QFrame, QComboBox,
-    QProgressBar, QScrollArea,
+    QProgressBar, QScrollArea, QCheckBox,
 )
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QEvent, QSettings
@@ -177,8 +177,7 @@ class CountWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class ImageEventFilter(QObject):
-    zoomed = pyqtSignal(int)
-    image_clicked = pyqtSignal()
+    zoomed = pyqtSignal(int, float, float)  # direction, viewport_x, viewport_y
 
     def __init__(self, scroll_area: QScrollArea):
         super().__init__()
@@ -204,7 +203,13 @@ class ImageEventFilter(QObject):
                 return False
 
             if etype == QEvent.Type.Wheel:
-                self.zoomed.emit(1 if event.angleDelta().y() > 0 else -1)
+                vp_pos = self._scroll.viewport().mapFromGlobal(
+                    event.globalPosition().toPoint()
+                )
+                self.zoomed.emit(
+                    1 if event.angleDelta().y() > 0 else -1,
+                    float(vp_pos.x()), float(vp_pos.y()),
+                )
                 return True
 
             if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
@@ -225,12 +230,9 @@ class ImageEventFilter(QObject):
                 return True
 
             if etype == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-                was_drag = self._dragged
                 self._drag_start = None
                 self._dragged = False
                 obj.setCursor(Qt.CursorShape.OpenHandCursor)
-                if not was_drag:
-                    self.image_clicked.emit()
                 return True
 
         except Exception:
@@ -291,6 +293,22 @@ COMBO_STYLE = """
     QComboBox QAbstractItemView {
         background-color: #3a3a3a; color: #dddddd;
         selection-background-color: #3c8dbc;
+    }
+"""
+CHECKBOX_STYLE = """
+    QCheckBox {
+        color: #cccccc; font-size: 11px; spacing: 6px;
+    }
+    QCheckBox::indicator {
+        width: 14px; height: 14px;
+        border-radius: 3px; border: 1px solid #555555;
+        background-color: #3a3a3a;
+    }
+    QCheckBox::indicator:checked {
+        background-color: #3c8dbc; border-color: #3c8dbc;
+    }
+    QCheckBox::indicator:disabled {
+        background-color: #2a2a2a; border-color: #444444;
     }
 """
 ICON_BTN_STYLE = """
@@ -435,12 +453,13 @@ class ImageViewer(QMainWindow):
         self._result_label.hide()
         layout.addWidget(self._result_label)
 
-        self._hint_label = QLabel("Click image to remove overlay")
-        self._hint_label.setWordWrap(True)
-        self._hint_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._hint_label.setStyleSheet("color: #888888; font-size: 10px; font-style: italic; padding-top: 4px;")
-        self._hint_label.hide()
-        layout.addWidget(self._hint_label)
+        self._overlay_check = QCheckBox("Show overlay")
+        self._overlay_check.setStyleSheet(CHECKBOX_STYLE)
+        self._overlay_check.setChecked(True)
+        self._overlay_check.setEnabled(False)
+        self._overlay_check.hide()
+        self._overlay_check.toggled.connect(self._on_overlay_toggled)
+        layout.addWidget(self._overlay_check)
 
         layout.addStretch()
         return sidebar
@@ -468,7 +487,6 @@ class ImageViewer(QMainWindow):
 
         self._evt_filter = ImageEventFilter(self._scroll)
         self._evt_filter.zoomed.connect(self._on_wheel_zoom)
-        self._evt_filter.image_clicked.connect(self._on_image_clicked)
         self._image_label.installEventFilter(self._evt_filter)
 
         vbox.addWidget(self._scroll, stretch=1)
@@ -559,7 +577,9 @@ class ImageViewer(QMainWindow):
         self._image_label.setCursor(Qt.CursorShape.OpenHandCursor)
 
         self._result_label.hide()
-        self._hint_label.hide()
+        self._overlay_check.hide()
+        self._overlay_check.setChecked(True)
+        self._overlay_check.setEnabled(False)
         self._count_btn.setEnabled(True)
         self._count_btn.setText("Count People")
 
@@ -573,15 +593,14 @@ class ImageViewer(QMainWindow):
     def _run_count(self):
         if not self._img_path:
             return
-        if self._overlay_active:
-            self._reset_to_original()
-            return
 
+        self._overlay_active = False
         self._count_btn.setEnabled(False)
         self._count_btn.hide()
         self._stop_btn.show()
         self._result_label.hide()
-        self._hint_label.hide()
+        self._overlay_check.hide()
+        self._overlay_check.setEnabled(False)
 
         # Prepare progressive overlay: start with a copy of the original
         self._wip_image = self._pil_image.convert("RGB").copy()
@@ -607,10 +626,22 @@ class ImageViewer(QMainWindow):
             self._worker.finished.disconnect()
             self._worker.failed.disconnect()
             self._worker.terminate()
-            self._worker.wait()
-            self._worker._cleanup_tmp()
-            self._worker = None
+            # Timeout avoids hanging if the thread is stuck in native code
+            if not self._worker.wait(3000):
+                # Thread didn't stop — detach and let it die on its own
+                self._worker = None
+            else:
+                self._worker._cleanup_tmp()
+                self._worker = None
         self._wip_image = None
+        self._overlay_active = False
+        self._overlay_check.hide()
+        self._overlay_check.setChecked(True)
+        self._overlay_check.setEnabled(False)
+        # Restore original image on display
+        if self._pil_image:
+            self._current_pixmap = pil_to_qpixmap(self._pil_image)
+            self._update_display()
         self._reset_counting_ui()
 
     def _on_tile_done(self, idx: int, total: int, count: float,
@@ -642,7 +673,9 @@ class ImageViewer(QMainWindow):
         self._result_label.setText(f"Estimated count:\n{total_count:.1f}")
         self._result_label.show()
         self._overlay_active = True
-        self._hint_label.show()
+        self._overlay_check.setChecked(True)
+        self._overlay_check.setEnabled(True)
+        self._overlay_check.show()
 
     def _on_count_error(self, msg: str):
         self._worker = None
@@ -660,25 +693,23 @@ class ImageViewer(QMainWindow):
         self._count_btn.show()
 
     # ------------------------------------------------------------------
-    # Overlay reset
+    # Overlay toggle
     # ------------------------------------------------------------------
 
-    def _on_image_clicked(self):
-        if self._overlay_active:
-            self._reset_to_original()
-
-    def _reset_to_original(self):
-        self._overlay_active = False
-        self._wip_image = None
-        self._current_pixmap = pil_to_qpixmap(self._pil_image)
-        self._hint_label.hide()
+    def _on_overlay_toggled(self, checked: bool):
+        if not self._overlay_active:
+            return
+        if checked:
+            self._current_pixmap = pil_to_qpixmap(self._wip_image)
+        else:
+            self._current_pixmap = pil_to_qpixmap(self._pil_image)
         self._update_display()
 
     # ------------------------------------------------------------------
     # Zoom
     # ------------------------------------------------------------------
 
-    def _zoom(self, factor: float):
+    def _zoom(self, factor: float, vp_x: float = None, vp_y: float = None):
         if self._current_pixmap is None:
             return
         if self._zoom_fit:
@@ -688,15 +719,24 @@ class ImageViewer(QMainWindow):
                 return
             self._zoom_factor = min(vp.width() / px.width(), vp.height() / px.height())
             self._zoom_fit = False
+        old_factor = self._zoom_factor
         self._zoom_factor = max(ZOOM_MIN, min(ZOOM_MAX, self._zoom_factor * factor))
         self._update_display()
+
+        # Adjust scroll so the point under the cursor stays fixed
+        if vp_x is not None and vp_y is not None:
+            ratio = self._zoom_factor / old_factor
+            hbar = self._scroll.horizontalScrollBar()
+            vbar = self._scroll.verticalScrollBar()
+            hbar.setValue(int((hbar.value() + vp_x) * ratio - vp_x))
+            vbar.setValue(int((vbar.value() + vp_y) * ratio - vp_y))
 
     def _zoom_reset(self):
         self._zoom_fit = True
         self._update_display()
 
-    def _on_wheel_zoom(self, direction: int):
-        self._zoom(ZOOM_STEP if direction > 0 else 1 / ZOOM_STEP)
+    def _on_wheel_zoom(self, direction: int, vp_x: float, vp_y: float):
+        self._zoom(ZOOM_STEP if direction > 0 else 1 / ZOOM_STEP, vp_x, vp_y)
 
     # ------------------------------------------------------------------
     # Arrow-key panning
