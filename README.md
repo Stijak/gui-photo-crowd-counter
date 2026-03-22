@@ -2,6 +2,12 @@
 
 A desktop application for viewing images and estimating crowd sizes in overhead photos using deep learning density-map models.
 
+![Image viewer](docs/viewer.png)
+*Image loaded and ready for counting*
+
+![Density map overlay](docs/density-overlay.png)
+*Density heatmap overlaid after counting — estimated 13,303 people*
+
 ## Features
 
 - **Image viewer** with zoom (mouse wheel, +/- buttons, fit-to-window), drag-to-pan, and arrow key navigation
@@ -11,7 +17,7 @@ A desktop application for viewing images and estimating crowd sizes in overhead 
   - **Bay** — Bayesian loss, high accuracy
   - **DM-Count** — state-of-the-art distribution matching
 - **Density map overlay** blended on top of the original image to visualise where the model detects people
-- Configurable **max resolution** to balance accuracy vs. memory usage
+- Automatic **tile-based processing** for large images to keep memory usage manageable
 - Remembers the last opened directory between sessions
 
 ## Requirements
@@ -40,8 +46,7 @@ python main.py
 
 1. Click **Open Image** to load a photo
 2. Select a **Model** and **Weights** from the sidebar (descriptions are shown for each)
-3. Set **Max Resolution** — lower values use less memory, higher values give more accurate counts
-4. Click **Count People** — a progress bar appears while the model runs
+3. Click **Count People** — a progress bar appears while the model runs
 5. The estimated count is displayed and a density heatmap is overlaid on the image
 6. **Click the image** to remove the overlay and return to the original
 7. Opening a new image resets everything
@@ -57,5 +62,5 @@ python main.py
 ## Notes
 
 - The first count with a given model/weights combination will download the model weights (~100 MB) to `~/.lwcc/weights/`. Subsequent runs use the cached files.
-- For very high-resolution images (e.g. 30+ MP), keep Max Resolution at 2000–3000 px to avoid excessive memory usage. The "Full" option processes at native resolution and can require many gigabytes of RAM.
+- Large images are automatically split into tiles (max 1000 px per dimension) to keep memory usage reasonable.
 - Counting runs in a background thread — the UI stays responsive and you can press **Stop** to cancel.

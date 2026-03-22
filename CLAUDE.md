@@ -32,15 +32,16 @@ All dependencies listed in `requirements.txt`.
 Single-file PyQt6 app (`main.py`) with these key components:
 
 - **`ImageViewer`** (QMainWindow) — main window, owns all UI and state
-- **`CountWorker`** (QThread) — runs lwcc inference off the main thread
+- **`CountWorker`** (QThread) — runs tile-based lwcc inference off the main thread (hardcoded 1000px max tile dimension)
 - **`ImageEventFilter`** (QObject) — event filter handling wheel-zoom, drag-to-pan, and click detection
-- **Helper functions** — `jet_colormap`, `blend_density`, `pil_to_qpixmap` for image processing
+- **Helper functions** — `jet_colormap`, `blend_tile_into`, `pil_to_qpixmap` for image processing
 
 ## Known Issues / Gotchas
 
 - **lwcc has a broken cache path** — it tries to write to `/.lwcc` (filesystem root). The `CountWorker` monkey-patches `lwcc.util.functions.weights_check` to use `~/.lwcc` instead.
 - **QImage does not own pixel data** — when converting PIL → QPixmap, always call `.copy()` on the QImage before creating the QPixmap, or the buffer will be freed by Python's GC.
-- **High-res images can exhaust memory** — lwcc with `resize_img=False` on a 30+ MP image can use 50+ GB. The app pre-resizes to a configurable max dimension (default 2000px) before passing to lwcc.
+- **High-res images can exhaust memory** — lwcc with `resize_img=False` on a 30+ MP image can use 50+ GB. The app automatically splits images into tiles (max 1000px per dimension) before passing to lwcc.
+- **Python exceptions in eventFilter crash the app** — PyQt6/SIP calls `qFatal()` → `abort()` if a Python exception escapes `eventFilter`. The filter body is wrapped in `try/except` to prevent this.
 
 ## Project State
 
