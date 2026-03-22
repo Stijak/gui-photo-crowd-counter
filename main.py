@@ -1,6 +1,7 @@
 import sys
 import tempfile
 import os
+import math
 import numpy as np
 from PIL import Image as PILImage
 from PyQt6.QtWidgets import (
@@ -70,66 +71,101 @@ ZOOM_STEP = 1.07
 ZOOM_MIN = 0.05
 ZOOM_MAX = 16.0
 ARROW_SCROLL_PX = 60
+OVERLAY_ALPHA = 0.35
 
 # ---------------------------------------------------------------------------
-# Background worker
+# Background worker — tile-based counting
 # ---------------------------------------------------------------------------
 
 class CountWorker(QThread):
-    finished = pyqtSignal(float, object)
+    # (tile_idx, total_tiles, tile_count, density_array, x, y, w, h)
+    tile_done = pyqtSignal(int, int, float, object, int, int, int, int)
+    finished = pyqtSignal(float)   # total count
     failed = pyqtSignal(str)
 
-    def __init__(self, img_path: str, model_name: str, model_weights: str, max_dim: int | None):
+    def __init__(self, img_path: str, model_name: str, model_weights: str,
+                 max_tile_dim: int | None):
         super().__init__()
         self.img_path = img_path
         self.model_name = model_name
         self.model_weights = model_weights
-        self.max_dim = max_dim
+        self.max_tile_dim = max_tile_dim   # None = no tiling (single block)
         self.tmp_path: str | None = None
 
     def run(self):
         try:
-            import lwcc.util.functions as _lwcc_fn
-            from pathlib import Path
-            import gdown as _gdown
+            self._patch_lwcc()
+            from lwcc import LWCC
 
-            def _weights_check_fixed(model_name, model_weights):
-                weights_dir = Path.home() / ".lwcc" / "weights"
-                weights_dir.mkdir(parents=True, exist_ok=True)
-                file_name = f"{model_name}_{model_weights}.pth"
-                output = str(weights_dir / file_name)
-                if not os.path.isfile(output):
-                    url = _lwcc_fn.build_url(file_name)
-                    _gdown.download(url, output, quiet=False)
-                return output
-
-            _lwcc_fn.weights_check = _weights_check_fixed
-
-            infer_path = self.img_path
             img = PILImage.open(self.img_path).convert("RGB")
-            w, h = img.size
-            if self.max_dim is not None and max(w, h) > self.max_dim:
-                scale = self.max_dim / max(w, h)
-                img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+            tiles = self._compute_tiles(*img.size)
+            total = len(tiles)
+            total_count = 0.0
+
+            for idx, (tx, ty, tw, th) in enumerate(tiles):
+                tile_img = img.crop((tx, ty, tx + tw, ty + th))
+
                 tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
                 self.tmp_path = tmp.name
                 tmp.close()
-                img.save(self.tmp_path)
-                infer_path = self.tmp_path
+                tile_img.save(self.tmp_path)
 
-            from lwcc import LWCC
-            count, density = LWCC.get_count(
-                infer_path,
-                model_name=self.model_name,
-                model_weights=self.model_weights,
-                return_density=True,
-                resize_img=False,
-            )
-            self.finished.emit(float(count), density)
+                count, density = LWCC.get_count(
+                    self.tmp_path,
+                    model_name=self.model_name,
+                    model_weights=self.model_weights,
+                    return_density=True,
+                    resize_img=False,
+                )
+                total_count += float(count)
+                self.tile_done.emit(idx, total, float(count), density,
+                                    tx, ty, tw, th)
+                self._cleanup_tmp()
+
+            self.finished.emit(total_count)
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
             self._cleanup_tmp()
+
+    # -- helpers --
+
+    def _patch_lwcc(self):
+        import lwcc.util.functions as _lwcc_fn
+        from pathlib import Path
+        import gdown as _gdown
+
+        def _weights_check_fixed(model_name, model_weights):
+            weights_dir = Path.home() / ".lwcc" / "weights"
+            weights_dir.mkdir(parents=True, exist_ok=True)
+            file_name = f"{model_name}_{model_weights}.pth"
+            output = str(weights_dir / file_name)
+            if not os.path.isfile(output):
+                url = _lwcc_fn.build_url(file_name)
+                _gdown.download(url, output, quiet=False)
+            return output
+
+        _lwcc_fn.weights_check = _weights_check_fixed
+
+    def _compute_tiles(self, width: int, height: int) -> list[tuple[int, int, int, int]]:
+        md = self.max_tile_dim
+        if md is None or max(width, height) <= md:
+            return [(0, 0, width, height)]
+
+        cols = math.ceil(width / md)
+        rows = math.ceil(height / md)
+        tile_w = math.ceil(width / cols)
+        tile_h = math.ceil(height / rows)
+
+        tiles = []
+        for r in range(rows):
+            for c in range(cols):
+                x = c * tile_w
+                y = r * tile_h
+                w = min(tile_w, width - x)
+                h = min(tile_h, height - y)
+                tiles.append((x, y, w, h))
+        return tiles
 
     def _cleanup_tmp(self):
         if self.tmp_path and os.path.exists(self.tmp_path):
@@ -141,8 +177,8 @@ class CountWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class ImageEventFilter(QObject):
-    zoomed = pyqtSignal(int)        # +1 in, -1 out
-    image_clicked = pyqtSignal()    # single click (not a drag)
+    zoomed = pyqtSignal(int)
+    image_clicked = pyqtSignal()
 
     def __init__(self, scroll_area: QScrollArea):
         super().__init__()
@@ -153,41 +189,56 @@ class ImageEventFilter(QObject):
         self._vbar_start = 0
 
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
-        etype = event.type()
+        try:
+            etype = event.type()
 
-        # Wheel → zoom
-        if etype == QEvent.Type.Wheel:
-            self.zoomed.emit(1 if event.angleDelta().y() > 0 else -1)
-            return True
+            # Reset drag state if widget loses focus mid-drag
+            if etype == QEvent.Type.FocusOut:
+                if self._drag_start is not None:
+                    self._drag_start = None
+                    self._dragged = False
+                    try:
+                        obj.setCursor(Qt.CursorShape.OpenHandCursor)
+                    except RuntimeError:
+                        pass
+                return False
 
-        # Left press → begin potential drag
-        if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-            self._drag_start = event.globalPosition().toPoint()
-            self._hbar_start = self._scroll.horizontalScrollBar().value()
-            self._vbar_start = self._scroll.verticalScrollBar().value()
-            self._dragged = False
-            obj.setCursor(Qt.CursorShape.ClosedHandCursor)
-            return True
+            if etype == QEvent.Type.Wheel:
+                self.zoomed.emit(1 if event.angleDelta().y() > 0 else -1)
+                return True
 
-        # Mouse move → pan if dragging
-        if etype == QEvent.Type.MouseMove and self._drag_start is not None:
-            delta = event.globalPosition().toPoint() - self._drag_start
-            if not self._dragged and (abs(delta.x()) > 4 or abs(delta.y()) > 4):
-                self._dragged = True
-            if self._dragged:
-                self._scroll.horizontalScrollBar().setValue(self._hbar_start - delta.x())
-                self._scroll.verticalScrollBar().setValue(self._vbar_start - delta.y())
-            return True
+            if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._drag_start = event.globalPosition().toPoint()
+                self._hbar_start = self._scroll.horizontalScrollBar().value()
+                self._vbar_start = self._scroll.verticalScrollBar().value()
+                self._dragged = False
+                obj.setCursor(Qt.CursorShape.ClosedHandCursor)
+                return True
 
-        # Left release → finish drag or emit click
-        if etype == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-            was_drag = self._dragged
+            if etype == QEvent.Type.MouseMove and self._drag_start is not None:
+                delta = event.globalPosition().toPoint() - self._drag_start
+                if not self._dragged and (abs(delta.x()) > 4 or abs(delta.y()) > 4):
+                    self._dragged = True
+                if self._dragged:
+                    self._scroll.horizontalScrollBar().setValue(self._hbar_start - delta.x())
+                    self._scroll.verticalScrollBar().setValue(self._vbar_start - delta.y())
+                return True
+
+            if etype == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                was_drag = self._dragged
+                self._drag_start = None
+                self._dragged = False
+                obj.setCursor(Qt.CursorShape.OpenHandCursor)
+                if not was_drag:
+                    self.image_clicked.emit()
+                return True
+
+        except Exception:
+            # Never let a Python exception escape into SIP/Qt — it calls
+            # qFatal() → abort(), crashing the entire application.
             self._drag_start = None
             self._dragged = False
-            obj.setCursor(Qt.CursorShape.OpenHandCursor)
-            if not was_drag:
-                self.image_clicked.emit()
-            return True
+            return False
 
         return False
 
@@ -202,24 +253,25 @@ def jet_colormap(data: np.ndarray) -> np.ndarray:
     return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
 
-def blend_density(original: PILImage.Image, density: np.ndarray, alpha: float = 0.35) -> QPixmap:
-    orig_w, orig_h = original.size
+def blend_tile_into(wip: PILImage.Image, orig: PILImage.Image,
+                    density: np.ndarray, x: int, y: int, w: int, h: int):
+    """Blend one tile's density heatmap into the working overlay image in-place."""
     d = density.astype(float)
     if d.max() > 0:
         d /= d.max()
-    coloured = PILImage.fromarray(jet_colormap(d), mode="RGB").resize((orig_w, orig_h), PILImage.LANCZOS)
-    blended = PILImage.blend(original.convert("RGB"), coloured, alpha=alpha)
-    raw = blended.tobytes("raw", "RGB")
-    # .copy() is critical: QImage does not own `raw`, so without copy the
-    # QPixmap would reference freed memory once `raw` is garbage-collected.
-    qimg = QImage(raw, orig_w, orig_h, orig_w * 3, QImage.Format.Format_RGB888).copy()
-    return QPixmap.fromImage(qimg)
+    coloured = PILImage.fromarray(jet_colormap(d), mode="RGB")
+    coloured = coloured.resize((w, h), PILImage.LANCZOS)
+    orig_tile = orig.crop((x, y, x + w, y + h)).convert("RGB")
+    blended = PILImage.blend(orig_tile, coloured, alpha=OVERLAY_ALPHA)
+    wip.paste(blended, (x, y))
 
 
 def pil_to_qpixmap(img: PILImage.Image) -> QPixmap:
     img_rgb = img.convert("RGB")
     w, h = img_rgb.size
     raw = img_rgb.tobytes("raw", "RGB")
+    # .copy() is critical: QImage does not own `raw`, so without copy the
+    # QPixmap would reference freed memory once `raw` is garbage-collected.
     qimg = QImage(raw, w, h, w * 3, QImage.Format.Format_RGB888).copy()
     return QPixmap.fromImage(qimg)
 
@@ -270,6 +322,11 @@ class ImageViewer(QMainWindow):
         self._overlay_active: bool = False
         self._worker: CountWorker | None = None
 
+        # Progressive overlay state
+        self._wip_image: PILImage.Image | None = None
+        self._running_count: float = 0.0
+
+        # Zoom state
         self._zoom_fit: bool = True
         self._zoom_factor: float = 1.0
 
@@ -341,22 +398,6 @@ class ImageViewer(QMainWindow):
 
         self._on_model_changed(DEFAULT_MODEL)
 
-        layout.addSpacing(6)
-
-        layout.addWidget(self._small_label("Max Resolution"))
-        self._res_combo = QComboBox()
-        self._res_combo.setStyleSheet(COMBO_STYLE)
-        self._res_combo.addItems(["1000 px", "2000 px", "3000 px", "4000 px", "Full"])
-        self._res_combo.setCurrentText("2000 px")
-        layout.addWidget(self._res_combo)
-        res_desc = QLabel(
-            "Longest edge limit before inference. Lower = faster and less memory. "
-            "Full resolution may use very large amounts of RAM."
-        )
-        res_desc.setWordWrap(True)
-        res_desc.setStyleSheet(DESC_STYLE)
-        layout.addWidget(res_desc)
-
         layout.addSpacing(10)
 
         self._count_btn = QPushButton("Count People")
@@ -425,7 +466,6 @@ class ImageViewer(QMainWindow):
         self._image_label.setText("Open an image to get started")
         self._scroll.setWidget(self._image_label)
 
-        # Event filter for zoom, drag-pan, and click
         self._evt_filter = ImageEventFilter(self._scroll)
         self._evt_filter.zoomed.connect(self._on_wheel_zoom)
         self._evt_filter.image_clicked.connect(self._on_image_clicked)
@@ -497,7 +537,6 @@ class ImageViewer(QMainWindow):
     # ------------------------------------------------------------------
 
     def _open_image(self):
-        # Stop any in-progress count before loading a new image
         if self._worker and self._worker.isRunning():
             self._stop_count()
 
@@ -515,6 +554,7 @@ class ImageViewer(QMainWindow):
         self._pil_image = PILImage.open(path)
         self._current_pixmap = pil_to_qpixmap(self._pil_image)
         self._overlay_active = False
+        self._wip_image = None
         self._image_label.setText("")
         self._image_label.setCursor(Qt.CursorShape.OpenHandCursor)
 
@@ -527,7 +567,7 @@ class ImageViewer(QMainWindow):
         self._scroll.setFocus()
 
     # ------------------------------------------------------------------
-    # Counting
+    # Counting (tile-based)
     # ------------------------------------------------------------------
 
     def _run_count(self):
@@ -542,47 +582,78 @@ class ImageViewer(QMainWindow):
         self._stop_btn.show()
         self._result_label.hide()
         self._hint_label.hide()
+
+        # Prepare progressive overlay: start with a copy of the original
+        self._wip_image = self._pil_image.convert("RGB").copy()
+        self._running_count = 0.0
+
+        # Start indeterminate until first tile reports back with total
+        self._progress_bar.setRange(0, 0)
         self._progress_bar.show()
 
         model_name = self._model_combo.currentText()
         weights = self._weights_combo.currentText()
-        res_text = self._res_combo.currentText()
-        max_dim = None if res_text == "Full" else int(res_text.split()[0])
 
-        self._worker = CountWorker(self._img_path, model_name, weights, max_dim)
-        self._worker.finished.connect(self._on_count_done)
+        self._worker = CountWorker(self._img_path, model_name, weights,
+                                   max_tile_dim=1000)
+        self._worker.tile_done.connect(self._on_tile_done)
+        self._worker.finished.connect(self._on_count_finished)
         self._worker.failed.connect(self._on_count_error)
         self._worker.start()
 
     def _stop_count(self):
         if self._worker and self._worker.isRunning():
+            self._worker.tile_done.disconnect()
             self._worker.finished.disconnect()
             self._worker.failed.disconnect()
             self._worker.terminate()
             self._worker.wait()
             self._worker._cleanup_tmp()
             self._worker = None
+        self._wip_image = None
         self._reset_counting_ui()
 
-    def _on_count_done(self, count: float, density: np.ndarray):
+    def _on_tile_done(self, idx: int, total: int, count: float,
+                      density: np.ndarray, x: int, y: int, w: int, h: int):
+        # Switch to determinate progress on first tile
+        if idx == 0:
+            self._progress_bar.setRange(0, total)
+        self._progress_bar.setValue(idx + 1)
+
+        self._running_count += count
+
+        # Blend this tile into the working image
+        blend_tile_into(self._wip_image, self._pil_image, density, x, y, w, h)
+
+        # Update live display
+        self._current_pixmap = pil_to_qpixmap(self._wip_image)
+        self._update_display()
+
+        # Show running count
+        self._result_label.setText(
+            f"Counting... {self._running_count:.1f}\n"
+            f"({idx + 1}/{total} tiles)"
+        )
+        self._result_label.show()
+
+    def _on_count_finished(self, total_count: float):
         self._worker = None
         self._reset_counting_ui()
-        self._result_label.setText(f"Estimated count:\n{count:.1f}")
+        self._result_label.setText(f"Estimated count:\n{total_count:.1f}")
         self._result_label.show()
-        overlay_px = blend_density(self._pil_image, density)
-        self._current_pixmap = overlay_px
         self._overlay_active = True
         self._hint_label.show()
-        self._update_display()
 
     def _on_count_error(self, msg: str):
         self._worker = None
+        self._wip_image = None
         self._reset_counting_ui()
         self._result_label.setText(f"Error:\n{msg}")
         self._result_label.show()
 
     def _reset_counting_ui(self):
         self._progress_bar.hide()
+        self._progress_bar.setRange(0, 0)   # reset to indeterminate for next run
         self._stop_btn.hide()
         self._count_btn.setText("Count People")
         self._count_btn.setEnabled(self._img_path is not None)
@@ -598,6 +669,7 @@ class ImageViewer(QMainWindow):
 
     def _reset_to_original(self):
         self._overlay_active = False
+        self._wip_image = None
         self._current_pixmap = pil_to_qpixmap(self._pil_image)
         self._hint_label.hide()
         self._update_display()
