@@ -5,7 +5,7 @@ import numpy as np
 from PIL import Image as PILImage
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
-    QPushButton, QLabel, QFileDialog, QFrame, QSizePolicy, QComboBox,
+    QPushButton, QLabel, QFileDialog, QFrame, QComboBox,
     QProgressBar, QScrollArea,
 )
 from PyQt6.QtGui import QPixmap, QImage
@@ -202,7 +202,7 @@ def jet_colormap(data: np.ndarray) -> np.ndarray:
     return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
 
-def blend_density(original: PILImage.Image, density: np.ndarray, alpha: float = 0.55) -> QPixmap:
+def blend_density(original: PILImage.Image, density: np.ndarray, alpha: float = 0.35) -> QPixmap:
     orig_w, orig_h = original.size
     d = density.astype(float)
     if d.max() > 0:
@@ -210,14 +210,18 @@ def blend_density(original: PILImage.Image, density: np.ndarray, alpha: float = 
     coloured = PILImage.fromarray(jet_colormap(d), mode="RGB").resize((orig_w, orig_h), PILImage.LANCZOS)
     blended = PILImage.blend(original.convert("RGB"), coloured, alpha=alpha)
     raw = blended.tobytes("raw", "RGB")
-    return QPixmap.fromImage(QImage(raw, orig_w, orig_h, orig_w * 3, QImage.Format.Format_RGB888))
+    # .copy() is critical: QImage does not own `raw`, so without copy the
+    # QPixmap would reference freed memory once `raw` is garbage-collected.
+    qimg = QImage(raw, orig_w, orig_h, orig_w * 3, QImage.Format.Format_RGB888).copy()
+    return QPixmap.fromImage(qimg)
 
 
 def pil_to_qpixmap(img: PILImage.Image) -> QPixmap:
     img_rgb = img.convert("RGB")
     w, h = img_rgb.size
     raw = img_rgb.tobytes("raw", "RGB")
-    return QPixmap.fromImage(QImage(raw, w, h, w * 3, QImage.Format.Format_RGB888))
+    qimg = QImage(raw, w, h, w * 3, QImage.Format.Format_RGB888).copy()
+    return QPixmap.fromImage(qimg)
 
 # ---------------------------------------------------------------------------
 # Styling constants
@@ -493,6 +497,10 @@ class ImageViewer(QMainWindow):
     # ------------------------------------------------------------------
 
     def _open_image(self):
+        # Stop any in-progress count before loading a new image
+        if self._worker and self._worker.isRunning():
+            self._stop_count()
+
         last_dir = self._settings.value("last_open_dir", "")
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Image", last_dir,
@@ -557,6 +565,7 @@ class ImageViewer(QMainWindow):
         self._reset_counting_ui()
 
     def _on_count_done(self, count: float, density: np.ndarray):
+        self._worker = None
         self._reset_counting_ui()
         self._result_label.setText(f"Estimated count:\n{count:.1f}")
         self._result_label.show()
@@ -567,6 +576,7 @@ class ImageViewer(QMainWindow):
         self._update_display()
 
     def _on_count_error(self, msg: str):
+        self._worker = None
         self._reset_counting_ui()
         self._result_label.setText(f"Error:\n{msg}")
         self._result_label.show()
@@ -602,6 +612,8 @@ class ImageViewer(QMainWindow):
         if self._zoom_fit:
             vp = self._scroll.viewport().size()
             px = self._current_pixmap
+            if px.width() == 0 or px.height() == 0 or vp.width() == 0 or vp.height() == 0:
+                return
             self._zoom_factor = min(vp.width() / px.width(), vp.height() / px.height())
             self._zoom_fit = False
         self._zoom_factor = max(ZOOM_MIN, min(ZOOM_MAX, self._zoom_factor * factor))
@@ -663,6 +675,13 @@ class ImageViewer(QMainWindow):
         super().resizeEvent(event)
         if self._zoom_fit and self._current_pixmap:
             self._update_display()
+
+    def closeEvent(self, event):
+        if self._worker and self._worker.isRunning():
+            self._worker.terminate()
+            self._worker.wait()
+            self._worker._cleanup_tmp()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # Helpers

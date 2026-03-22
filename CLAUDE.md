@@ -16,8 +16,32 @@ python main.py
 
 - Python 3.14 (virtual environment at `.venv/`)
 - Black formatter configured (via PyCharm IDE settings)
-- No test framework or external dependencies installed yet
+- macOS (Homebrew Python — tkinter is NOT available, use PyQt6 for GUI)
+
+## Dependencies
+
+- **PyQt6** — GUI framework (replaced tkinter due to missing Tk support in Homebrew Python)
+- **Pillow** — image loading and manipulation
+- **numpy** — array operations for density maps
+- **lwcc** — crowd counting models (pulls in PyTorch, torchvision, gdown)
+
+All dependencies listed in `requirements.txt`.
+
+## Architecture
+
+Single-file PyQt6 app (`main.py`) with these key components:
+
+- **`ImageViewer`** (QMainWindow) — main window, owns all UI and state
+- **`CountWorker`** (QThread) — runs lwcc inference off the main thread
+- **`ImageEventFilter`** (QObject) — event filter handling wheel-zoom, drag-to-pan, and click detection
+- **Helper functions** — `jet_colormap`, `blend_density`, `pil_to_qpixmap` for image processing
+
+## Known Issues / Gotchas
+
+- **lwcc has a broken cache path** — it tries to write to `/.lwcc` (filesystem root). The `CountWorker` monkey-patches `lwcc.util.functions.weights_check` to use `~/.lwcc` instead.
+- **QImage does not own pixel data** — when converting PIL → QPixmap, always call `.copy()` on the QImage before creating the QPixmap, or the buffer will be freed by Python's GC.
+- **High-res images can exhaust memory** — lwcc with `resize_img=False` on a 30+ MP image can use 50+ GB. The app pre-resizes to a configurable max dimension (default 2000px) before passing to lwcc.
 
 ## Project State
 
-This is a fresh starter project. The only file is `main.py` with PyCharm's default boilerplate. The project name "PythonCounting" suggests the intent is to build counting-related functionality.
+Desktop image viewer with crowd counting functionality. The sidebar has space reserved for adding future tools/features.
