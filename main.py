@@ -7,7 +7,7 @@ from PIL import Image as PILImage
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QLabel, QFileDialog, QFrame, QComboBox,
-    QProgressBar, QScrollArea, QCheckBox,
+    QProgressBar, QScrollArea, QCheckBox, QSpinBox,
 )
 from PyQt6.QtGui import QPixmap, QImage
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QEvent, QSettings
@@ -72,6 +72,7 @@ ZOOM_MIN = 0.05
 ZOOM_MAX = 16.0
 ARROW_SCROLL_PX = 60
 OVERLAY_ALPHA = 0.35
+TILE_OVERLAP = 64   # px of overlap added on each side of every tile
 
 # ---------------------------------------------------------------------------
 # Background worker — tile-based counting
@@ -84,13 +85,15 @@ class CountWorker(QThread):
     failed = pyqtSignal(str)
 
     def __init__(self, img_path: str, model_name: str, model_weights: str,
-                 max_tile_dim: int | None):
+                 max_tile_dim: int | None, overlap: int = TILE_OVERLAP):
         super().__init__()
         self.img_path = img_path
         self.model_name = model_name
         self.model_weights = model_weights
         self.max_tile_dim = max_tile_dim   # None = no tiling (single block)
+        self.overlap = overlap
         self.tmp_path: str | None = None
+        self._stop_requested = False
 
     def run(self):
         try:
@@ -102,8 +105,11 @@ class CountWorker(QThread):
             total = len(tiles)
             total_count = 0.0
 
-            for idx, (tx, ty, tw, th) in enumerate(tiles):
-                tile_img = img.crop((tx, ty, tx + tw, ty + th))
+            for idx, (px, py, pw, ph, cx, cy, cw, ch) in enumerate(tiles):
+                if self._stop_requested:
+                    break
+
+                tile_img = img.crop((cx, cy, cx + cw, cy + ch))
 
                 tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
                 self.tmp_path = tmp.name
@@ -117,16 +123,33 @@ class CountWorker(QThread):
                     return_density=True,
                     resize_img=False,
                 )
-                total_count += float(count)
-                self.tile_done.emit(idx, total, float(count), density,
-                                    tx, ty, tw, th)
                 self._cleanup_tmp()
 
-            self.finished.emit(total_count)
+                # Crop density to the non-overlapping paste region,
+                # removing the border pixels added for context.
+                density_h, density_w = density.shape[:2]
+                off_x, off_y = px - cx, py - cy
+                sx, sy = density_w / cw, density_h / ch
+                d_x0 = max(0, round(off_x * sx))
+                d_y0 = max(0, round(off_y * sy))
+                d_x1 = min(density_w, round((off_x + pw) * sx))
+                d_y1 = min(density_h, round((off_y + ph) * sy))
+                cropped_density = density[d_y0:d_y1, d_x0:d_x1]
+
+                tile_count = float(cropped_density.sum())
+                total_count += tile_count
+                self.tile_done.emit(idx, total, tile_count, cropped_density,
+                                    px, py, pw, ph)
+
+            if not self._stop_requested:
+                self.finished.emit(total_count)
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:
             self._cleanup_tmp()
+
+    def request_stop(self):
+        self._stop_requested = True
 
     # -- helpers --
 
@@ -147,24 +170,35 @@ class CountWorker(QThread):
 
         _lwcc_fn.weights_check = _weights_check_fixed
 
-    def _compute_tiles(self, width: int, height: int) -> list[tuple[int, int, int, int]]:
+    def _compute_tiles(self, width: int, height: int) -> list[tuple[int, int, int, int, int, int, int, int]]:
+        """Return list of (paste_x, paste_y, paste_w, paste_h, crop_x, crop_y, crop_w, crop_h).
+
+        paste_* is the non-overlapping grid cell to write results into.
+        crop_* is the expanded region (with overlap) passed to the model for better context.
+        """
         md = self.max_tile_dim
         if md is None or max(width, height) <= md:
-            return [(0, 0, width, height)]
+            return [(0, 0, width, height, 0, 0, width, height)]
 
         cols = math.ceil(width / md)
         rows = math.ceil(height / md)
         tile_w = math.ceil(width / cols)
         tile_h = math.ceil(height / rows)
+        ov = self.overlap
 
         tiles = []
         for r in range(rows):
             for c in range(cols):
-                x = c * tile_w
-                y = r * tile_h
-                w = min(tile_w, width - x)
-                h = min(tile_h, height - y)
-                tiles.append((x, y, w, h))
+                px = c * tile_w
+                py = r * tile_h
+                pw = min(tile_w, width - px)
+                ph = min(tile_h, height - py)
+                # Expand by overlap, clamped to image bounds
+                cx = max(0, px - ov)
+                cy = max(0, py - ov)
+                cx2 = min(width, px + pw + ov)
+                cy2 = min(height, py + ph + ov)
+                tiles.append((px, py, pw, ph, cx, cy, cx2 - cx, cy2 - cy))
         return tiles
 
     def _cleanup_tmp(self):
@@ -256,11 +290,17 @@ def jet_colormap(data: np.ndarray) -> np.ndarray:
 
 
 def blend_tile_into(wip: PILImage.Image, orig: PILImage.Image,
-                    density: np.ndarray, x: int, y: int, w: int, h: int):
-    """Blend one tile's density heatmap into the working overlay image in-place."""
+                    density: np.ndarray, x: int, y: int, w: int, h: int,
+                    global_max: float = 0.0):
+    """Blend one tile's density heatmap into the working overlay image in-place.
+
+    global_max: the maximum density value across all tiles (for consistent colour
+    scaling). If 0 or not provided, falls back to per-tile normalisation.
+    """
     d = density.astype(float)
-    if d.max() > 0:
-        d /= d.max()
+    scale = global_max if global_max > 0 else d.max()
+    if scale > 0:
+        d /= scale
     coloured = PILImage.fromarray(jet_colormap(d), mode="RGB")
     coloured = coloured.resize((w, h), PILImage.LANCZOS)
     orig_tile = orig.crop((x, y, x + w, y + h)).convert("RGB")
@@ -343,6 +383,8 @@ class ImageViewer(QMainWindow):
         # Progressive overlay state
         self._wip_image: PILImage.Image | None = None
         self._running_count: float = 0.0
+        self._tile_densities: list = []   # [(density, x, y, w, h), ...]
+        self._global_density_max: float = 0.0
 
         # Zoom state
         self._zoom_fit: bool = True
@@ -415,6 +457,23 @@ class ImageViewer(QMainWindow):
         layout.addWidget(self._weights_desc)
 
         self._on_model_changed(DEFAULT_MODEL)
+
+        layout.addSpacing(10)
+
+        layout.addWidget(self._small_label("Max tile size (px)"))
+        self._tile_spin = QSpinBox()
+        self._tile_spin.setRange(256, 4096)
+        self._tile_spin.setSingleStep(128)
+        self._tile_spin.setValue(1000)
+        self._tile_spin.setStyleSheet("""
+            QSpinBox {
+                background-color: #3a3a3a; color: #dddddd;
+                border: 1px solid #555555; border-radius: 3px;
+                padding: 4px 6px; font-size: 11px;
+            }
+            QSpinBox::up-button, QSpinBox::down-button { width: 16px; }
+        """)
+        layout.addWidget(self._tile_spin)
 
         layout.addSpacing(10)
 
@@ -605,6 +664,8 @@ class ImageViewer(QMainWindow):
         # Prepare progressive overlay: start with a copy of the original
         self._wip_image = self._pil_image.convert("RGB").copy()
         self._running_count = 0.0
+        self._tile_densities = []
+        self._global_density_max = 0.0
 
         # Start indeterminate until first tile reports back with total
         self._progress_bar.setRange(0, 0)
@@ -612,9 +673,10 @@ class ImageViewer(QMainWindow):
 
         model_name = self._model_combo.currentText()
         weights = self._weights_combo.currentText()
+        max_tile_dim = self._tile_spin.value()
 
         self._worker = CountWorker(self._img_path, model_name, weights,
-                                   max_tile_dim=1000)
+                                   max_tile_dim=max_tile_dim)
         self._worker.tile_done.connect(self._on_tile_done)
         self._worker.finished.connect(self._on_count_finished)
         self._worker.failed.connect(self._on_count_error)
@@ -625,15 +687,23 @@ class ImageViewer(QMainWindow):
             self._worker.tile_done.disconnect()
             self._worker.finished.disconnect()
             self._worker.failed.disconnect()
-            self._worker.terminate()
-            # Timeout avoids hanging if the thread is stuck in native code
-            if not self._worker.wait(3000):
-                # Thread didn't stop — detach and let it die on its own
-                self._worker = None
+            # Ask the thread to stop cooperatively between tiles
+            self._worker.request_stop()
+            if not self._worker.wait(5000):
+                # Still running (stuck inside lwcc inference) — force kill
+                self._worker.terminate()
+                if not self._worker.wait(2000):
+                    # Truly stuck; detach and let it die on its own
+                    self._worker = None
+                else:
+                    self._worker._cleanup_tmp()
+                    self._worker = None
             else:
                 self._worker._cleanup_tmp()
                 self._worker = None
         self._wip_image = None
+        self._tile_densities = []
+        self._global_density_max = 0.0
         self._overlay_active = False
         self._overlay_check.hide()
         self._overlay_check.setChecked(True)
@@ -652,9 +722,20 @@ class ImageViewer(QMainWindow):
         self._progress_bar.setValue(idx + 1)
 
         self._running_count += count
+        self._tile_densities.append((density, x, y, w, h))
 
-        # Blend this tile into the working image
-        blend_tile_into(self._wip_image, self._pil_image, density, x, y, w, h)
+        # Update global max; if it grew, re-render all completed tiles so
+        # the colour scale stays consistent across the whole image.
+        tile_max = float(density.max()) if density.size else 0.0
+        if tile_max > self._global_density_max:
+            self._global_density_max = tile_max
+            self._wip_image = self._pil_image.convert("RGB").copy()
+            for d, tx, ty, tw, th in self._tile_densities:
+                blend_tile_into(self._wip_image, self._pil_image, d,
+                                 tx, ty, tw, th, self._global_density_max)
+        else:
+            blend_tile_into(self._wip_image, self._pil_image, density,
+                            x, y, w, h, self._global_density_max)
 
         # Update live display
         self._current_pixmap = pil_to_qpixmap(self._wip_image)
