@@ -211,11 +211,13 @@ class CountWorker(QThread):
 # ---------------------------------------------------------------------------
 
 class ImageEventFilter(QObject):
-    zoomed = pyqtSignal(int, float, float)  # direction, viewport_x, viewport_y
+    zoomed = pyqtSignal(int, float, float)       # direction, viewport_x, viewport_y
+    pinch_zoomed = pyqtSignal(float, float, float)  # scale_factor, viewport_x, viewport_y
 
-    def __init__(self, scroll_area: QScrollArea):
+    def __init__(self, scroll_area: QScrollArea, image_label: QLabel):
         super().__init__()
         self._scroll = scroll_area
+        self._image_label = image_label
         self._drag_start = None
         self._dragged = False
         self._hbar_start = 0
@@ -224,6 +226,26 @@ class ImageEventFilter(QObject):
     def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         try:
             etype = event.type()
+
+            # Trackpad pinch-to-zoom: NativeGesture is delivered to QWindow,
+            # so this filter is also installed on windowHandle().
+            if etype == QEvent.Type.NativeGesture:
+                if event.gestureType() == Qt.NativeGestureType.ZoomNativeGesture:
+                    value = event.value()
+                    if value != 0.0:
+                        vp_pos = self._scroll.viewport().mapFromGlobal(
+                            event.globalPosition().toPoint()
+                        )
+                        self.pinch_zoomed.emit(
+                            1.0 + value,
+                            float(vp_pos.x()), float(vp_pos.y()),
+                        )
+                    return True
+                return False
+
+            # All remaining events only apply to the image label
+            if obj is not self._image_label:
+                return False
 
             # Reset drag state if widget loses focus mid-drag
             if etype == QEvent.Type.FocusOut:
@@ -240,11 +262,15 @@ class ImageEventFilter(QObject):
                 vp_pos = self._scroll.viewport().mapFromGlobal(
                     event.globalPosition().toPoint()
                 )
-                self.zoomed.emit(
-                    1 if event.angleDelta().y() > 0 else -1,
-                    float(vp_pos.x()), float(vp_pos.y()),
-                )
-                return True
+                angle_y = event.angleDelta().y()
+                # Regular scroll-wheel zoom (discrete steps)
+                if angle_y != 0:
+                    self.zoomed.emit(
+                        1 if angle_y > 0 else -1,
+                        float(vp_pos.x()), float(vp_pos.y()),
+                    )
+                    return True
+                return False  # let horizontal scrolls pass through
 
             if etype == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 self._drag_start = event.globalPosition().toPoint()
@@ -544,8 +570,9 @@ class ImageViewer(QMainWindow):
         self._image_label.setText("Open an image to get started")
         self._scroll.setWidget(self._image_label)
 
-        self._evt_filter = ImageEventFilter(self._scroll)
+        self._evt_filter = ImageEventFilter(self._scroll, self._image_label)
         self._evt_filter.zoomed.connect(self._on_wheel_zoom)
+        self._evt_filter.pinch_zoomed.connect(self._on_pinch_zoom)
         self._image_label.installEventFilter(self._evt_filter)
 
         vbox.addWidget(self._scroll, stretch=1)
@@ -819,6 +846,9 @@ class ImageViewer(QMainWindow):
     def _on_wheel_zoom(self, direction: int, vp_x: float, vp_y: float):
         self._zoom(ZOOM_STEP if direction > 0 else 1 / ZOOM_STEP, vp_x, vp_y)
 
+    def _on_pinch_zoom(self, scale: float, vp_x: float, vp_y: float):
+        self._zoom(scale, vp_x, vp_y)
+
     # ------------------------------------------------------------------
     # Arrow-key panning
     # ------------------------------------------------------------------
@@ -912,4 +942,7 @@ if __name__ == "__main__":
     app.setStyle("Fusion")
     window = ImageViewer()
     window.show()
+    # Install pinch-zoom filter on the native window (NativeGesture events
+    # are delivered to QWindow, not to child widgets).
+    window.windowHandle().installEventFilter(window._evt_filter)
     sys.exit(app.exec())
